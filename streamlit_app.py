@@ -487,6 +487,115 @@ with tab_logging:
         st.info("We will implement Add-from-PO and R&D-only add flows next.")
 
     st.divider()
+    st.subheader("Admin: Edit products")
+    st.caption("This edits the master product list. Stock is always calculated from the movement log.")
+
+    # Only allow the known admin in this prototype
+    is_admin = st.session_state.user_email.strip().lower() == LOGIN_USER
+
+    if not is_admin:
+        st.info("Admin editor is not available for your account.")
+    else:
+        editable = products[["id", "type", "crs_mrs", "name", "product_code", "supplier", "unit", "min_stock"]].copy()
+
+        st.warning(
+            "Avoid changing product_code for existing items unless you understand the impact. "
+            "Movements are linked to product_code. If you change it, historical movements will no longer match."
+        )
+
+        edited = st.data_editor(
+            editable,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "type": st.column_config.TextColumn("Type"),
+                "crs_mrs": st.column_config.TextColumn("CRS/MRS"),
+                "name": st.column_config.TextColumn("Name"),
+                "product_code": st.column_config.TextColumn("ProductCode"),
+                "supplier": st.column_config.TextColumn("Supplier"),
+                "unit": st.column_config.TextColumn("Unit"),
+                "min_stock": st.column_config.NumberColumn("Min stock", min_value=0.0, step=1.0),
+            },
+        )
+
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            commit_products = st.button("Commit product changes")
+
+        if commit_products:
+            # Basic validation
+            if edited["product_code"].astype(str).str.strip().eq("").any():
+                st.error("ProductCode cannot be blank.")
+                st.stop()
+
+            # Duplicate ProductCode check
+            pc = edited["product_code"].astype(str).str.strip()
+            if pc.duplicated().any():
+                st.error("Duplicate ProductCode found. Each ProductCode should be unique.")
+                st.stop()
+
+            # Determine row-level changes
+            before = editable.set_index("id")
+            after = edited.copy()
+            after["id"] = pd.to_numeric(after["id"], errors="coerce")
+
+            # Rows with existing IDs
+            existing = after.dropna(subset=["id"]).copy()
+            existing["id"] = existing["id"].astype(int)
+
+            # New rows (id missing)
+            new_rows = after[after["id"].isna()].copy()
+
+            # Update existing rows
+            for _, row in existing.iterrows():
+                rid = int(row["id"])
+                if rid not in before.index:
+                    continue
+
+                # Build update payload
+                conn.execute(
+                    """
+                    UPDATE products SET
+                        type = ?, crs_mrs = ?, name = ?, product_code = ?, supplier = ?, unit = ?, min_stock = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        safe_str(row["type"]),
+                        safe_str(row["crs_mrs"]),
+                        safe_str(row["name"]),
+                        safe_str(row["product_code"]),
+                        safe_str(row["supplier"]),
+                        safe_str(row["unit"]),
+                        float(row["min_stock"]) if not pd.isna(row["min_stock"]) else 0.0,
+                        rid,
+                    ),
+                )
+
+            # Insert new rows
+            for _, row in new_rows.iterrows():
+                conn.execute(
+                    """
+                    INSERT INTO products (type, crs_mrs, name, product_code, supplier, unit, min_stock)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        safe_str(row.get("type", "")),
+                        safe_str(row.get("crs_mrs", "")),
+                        safe_str(row.get("name", "")),
+                        safe_str(row.get("product_code", "")),
+                        safe_str(row.get("supplier", "")),
+                        safe_str(row.get("unit", "")),
+                        float(row.get("min_stock", 0.0)) if not pd.isna(row.get("min_stock", 0.0)) else 0.0,
+                    ),
+                )
+
+            conn.commit()
+            st.success("Products updated.")
+            st.rerun()
+
+    st.divider()
     st.subheader("Exports")
     if st.button("Download inventory + movement log (Excel)"):
         # Refresh data for export
