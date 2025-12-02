@@ -596,16 +596,21 @@ with tab_logging:
         with st.expander("Bulk import Movements (optional)", expanded=False):
             st.markdown(
                 "Upload historical movement logs. These rows will be **inserted** into the append-only movement table.\n\n"
-                "Minimum required columns (case-insensitive): **timestamp_utc**, **product_code**, and either **qty_change** (signed) or (**direction** and **quantity**).\n\n"
-                "Optional: supplier, unit, reason, reason_other, rec_number, comments, person_name, person_email, type, crs_mrs, name."
-            ): **timestamp_utc**, **product_code**, and either **qty_change** (signed) or (**direction** and **quantity**).
-
-"
+                "Minimum required columns (case-insensitive): **timestamp_utc**, **product_code**, and either **qty_change** (signed) "
+                "or (**direction** and **quantity**).\n\n"
                 "Optional: supplier, unit, reason, reason_other, rec_number, comments, person_name, person_email, type, crs_mrs, name."
             )
-
-            mv_file = st.file_uploader("Upload Movements (XLSX/CSV)", type=["xlsx", "csv"], key="bulk_movements")
-            mv_sheet = st.text_input("Excel sheet name (if XLSX)", value="Movements", key="bulk_movements_sheet")
+        
+            mv_file = st.file_uploader(
+                "Upload Movements (XLSX/CSV)",
+                type=["xlsx", "csv"],
+                key="bulk_movements",
+            )
+            mv_sheet = st.text_input(
+                "Excel sheet name (if XLSX)",
+                value="Movements",
+                key="bulk_movements_sheet",
+            )
 
             if mv_file is not None:
                 try:
