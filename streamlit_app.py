@@ -501,7 +501,6 @@ with tab_logging:
                 "If an uploaded row has an existing **product_code**, it will **update** the product. Otherwise it will **insert** a new product."
             ): **type, crs_mrs, name, product_code, supplier, unit, min_stock**.
 
-"
                 "If an uploaded row has an existing **product_code**, it will **update** the product. Otherwise it will **insert** a new product."
             )
 
