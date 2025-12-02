@@ -491,21 +491,27 @@ with tab_logging:
     st.caption("Upload Products (and optionally Movements) to quickly populate the database.")
 
     is_admin = st.session_state.user_email.strip().lower() == LOGIN_USER
-    if not is_admin:
-        st.info("Bulk import is not available for your account.")
-    else:
-        with st.expander("Bulk import Products", expanded=True):
-            st.markdown(
-                "Upload an Excel or CSV containing product master data.\n\n"
-                "Required columns (case-insensitive): **type, crs_mrs, name, product_code, supplier, unit, min_stock**.\n\n"
-                "If an uploaded row has an existing **product_code**, it will **update** the product. Otherwise it will **insert** a new product."
-            ): **type, crs_mrs, name, product_code, supplier, unit, min_stock**.
+        if not is_admin:
+            st.info("Bulk import is not available for your account.")
+        else:
+            with st.expander("Bulk import Products", expanded=True):
+                st.markdown(
+                    "Upload an Excel or CSV containing product master data.\n\n"
+                    "Required columns (case-insensitive): **type, crs_mrs, name, product_code, supplier, unit, min_stock**.\n\n"
+                    "If an uploaded row has an existing **product_code**, it will **update** the product. Otherwise it will **insert** a new product."
+                )
+        
+                product_file = st.file_uploader(
+                    "Upload Products (XLSX/CSV)",
+                    type=["xlsx", "csv"],
+                    key="bulk_products",
+                )
+                sheet_name = st.text_input(
+                    "Excel sheet name (if XLSX)",
+                    value="Products",
+                    key="bulk_products_sheet",
+                )
 
-                "If an uploaded row has an existing **product_code**, it will **update** the product. Otherwise it will **insert** a new product."
-            )
-
-            product_file = st.file_uploader("Upload Products (XLSX/CSV)", type=["xlsx", "csv"], key="bulk_products")
-            sheet_name = st.text_input("Excel sheet name (if XLSX)", value="Products", key="bulk_products_sheet")
 
             if product_file is not None:
                 try:
