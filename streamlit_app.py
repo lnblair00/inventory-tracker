@@ -9,6 +9,7 @@ import pandas as pd
 import sqlite3
 import streamlit as st
 
+#undo cache 
 st.set_page_config(page_title="Company Inventory", layout="wide")
 
 # -----------------------------------------------------------------------------
