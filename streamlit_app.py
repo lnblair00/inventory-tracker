@@ -487,10 +487,201 @@ with tab_logging:
         st.info("We will implement Add-from-PO and R&D-only add flows next.")
 
     st.divider()
+    st.subheader("Admin: Bulk import")
+    st.caption("Upload Products (and optionally Movements) to quickly populate the database.")
+
+    is_admin = st.session_state.user_email.strip().lower() == LOGIN_USER
+    if not is_admin:
+        st.info("Bulk import is not available for your account.")
+    else:
+        with st.expander("Bulk import Products", expanded=True):
+            st.markdown(
+                "Upload an Excel or CSV containing product master data.
+
+"
+                "Required columns (case-insensitive): **type, crs_mrs, name, product_code, supplier, unit, min_stock**.
+
+"
+                "If an uploaded row has an existing **product_code**, it will **update** the product. Otherwise it will **insert** a new product."
+            )
+
+            product_file = st.file_uploader("Upload Products (XLSX/CSV)", type=["xlsx", "csv"], key="bulk_products")
+            sheet_name = st.text_input("Excel sheet name (if XLSX)", value="Products", key="bulk_products_sheet")
+
+            if product_file is not None:
+                try:
+                    if product_file.name.lower().endswith(".csv"):
+                        df_up = pd.read_csv(product_file)
+                    else:
+                        df_up = pd.read_excel(product_file, sheet_name=sheet_name)
+
+                    df_up = df_up.copy()
+                    df_up.columns = [str(c).strip().lower() for c in df_up.columns]
+
+                    required = ["type", "crs_mrs", "name", "product_code", "supplier", "unit", "min_stock"]
+                    missing = [c for c in required if c not in df_up.columns]
+                    if missing:
+                        st.error(f"Missing required columns: {missing}")
+                    else:
+                        # Clean and validate
+                        df_up = df_up[required].copy()
+                        for c in ["type", "crs_mrs", "name", "product_code", "supplier", "unit"]:
+                            df_up[c] = df_up[c].astype(str).map(lambda x: x.strip())
+
+                        df_up["min_stock"] = pd.to_numeric(df_up["min_stock"], errors="coerce").fillna(0.0)
+
+                        # Drop blank product codes
+                        df_up = df_up[df_up["product_code"].astype(str).str.strip().ne("")].copy()
+
+                        # Duplicate check within upload
+                        if df_up["product_code"].duplicated().any():
+                            dups = df_up[df_up["product_code"].duplicated()]["product_code"].tolist()
+                            st.error(f"Duplicate product_code values in upload: {sorted(set(dups))}")
+                        else:
+                            st.write("Preview (first 25 rows):")
+                            st.dataframe(df_up.head(25), use_container_width=True, hide_index=True)
+
+                            do_import = st.button("Import Products", key="do_import_products")
+                            if do_import:
+                                # Existing product codes
+                                existing_df = df_from_query(conn, "SELECT id, product_code FROM products")
+                                code_to_id = {safe_str(r["product_code"]): int(r["id"]) for _, r in existing_df.iterrows()}
+
+                                inserts = 0
+                                updates = 0
+                                for _, row in df_up.iterrows():
+                                    pc = safe_str(row["product_code"])
+                                    payload = (
+                                        safe_str(row["type"]),
+                                        safe_str(row["crs_mrs"]),
+                                        safe_str(row["name"]),
+                                        pc,
+                                        safe_str(row["supplier"]),
+                                        safe_str(row["unit"]),
+                                        float(row["min_stock"]),
+                                    )
+
+                                    if pc in code_to_id:
+                                        conn.execute(
+                                            """
+                                            UPDATE products SET
+                                                type = ?, crs_mrs = ?, name = ?, product_code = ?, supplier = ?, unit = ?, min_stock = ?
+                                            WHERE id = ?
+                                            """,
+                                            payload + (code_to_id[pc],),
+                                        )
+                                        updates += 1
+                                    else:
+                                        conn.execute(
+                                            """
+                                            INSERT INTO products (type, crs_mrs, name, product_code, supplier, unit, min_stock)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                            """,
+                                            payload,
+                                        )
+                                        inserts += 1
+
+                                conn.commit()
+                                st.success(f"Import complete. Inserted: {inserts}. Updated: {updates}.")
+                                st.rerun()
+
+                except Exception as e:
+                    st.error(f"Could not read file: {e}")
+
+        with st.expander("Bulk import Movements (optional)", expanded=False):
+            st.markdown(
+                "Upload historical movement logs. These rows will be **inserted** into the append-only movement table.
+
+"
+                "Minimum required columns (case-insensitive): **timestamp_utc**, **product_code**, and either **qty_change** (signed) or (**direction** and **quantity**).
+
+"
+                "Optional: supplier, unit, reason, reason_other, rec_number, comments, person_name, person_email, type, crs_mrs, name."
+            )
+
+            mv_file = st.file_uploader("Upload Movements (XLSX/CSV)", type=["xlsx", "csv"], key="bulk_movements")
+            mv_sheet = st.text_input("Excel sheet name (if XLSX)", value="Movements", key="bulk_movements_sheet")
+
+            if mv_file is not None:
+                try:
+                    if mv_file.name.lower().endswith(".csv"):
+                        mv = pd.read_csv(mv_file)
+                    else:
+                        mv = pd.read_excel(mv_file, sheet_name=mv_sheet)
+
+                    mv = mv.copy()
+                    mv.columns = [str(c).strip().lower() for c in mv.columns]
+
+                    if "timestamp_utc" not in mv.columns or "product_code" not in mv.columns:
+                        st.error("Movements upload must include timestamp_utc and product_code")
+                    else:
+                        mv["timestamp_utc"] = pd.to_datetime(mv["timestamp_utc"], errors="coerce", utc=True)
+                        mv = mv.dropna(subset=["timestamp_utc"]).copy()
+                        mv["timestamp_utc"] = mv["timestamp_utc"].dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+                        if "qty_change" in mv.columns:
+                            mv["qty_change"] = pd.to_numeric(mv["qty_change"], errors="coerce").fillna(0.0)
+                        elif "direction" in mv.columns and "quantity" in mv.columns:
+                            mv["quantity"] = pd.to_numeric(mv["quantity"], errors="coerce").fillna(0.0)
+                            mv["qty_change"] = mv.apply(lambda r: float(r["quantity"]) if str(r["direction"]).strip().upper() == "IN" else -float(r["quantity"]), axis=1)
+                        else:
+                            st.error("Need qty_change OR (direction + quantity)")
+                            mv = None
+
+                        if mv is not None:
+                            mv["product_code"] = mv["product_code"].astype(str).map(lambda x: x.strip())
+                            mv = mv[mv["product_code"].ne("")].copy()
+
+                            # Preview
+                            preview_cols = [c for c in ["timestamp_utc", "product_code", "qty_change", "rec_number", "supplier", "reason"] if c in mv.columns]
+                            st.write("Preview (first 25 rows):")
+                            st.dataframe(mv[preview_cols].head(25), use_container_width=True, hide_index=True)
+
+                            do_mv_import = st.button("Import Movements", key="do_import_movements")
+                            if do_mv_import:
+                                # Make sure required optional columns exist
+                                def colv(col, default=""):
+                                    return mv[col] if col in mv.columns else pd.Series([default] * len(mv))
+
+                                rows = []
+                                for i in range(len(mv)):
+                                    rows.append((
+                                        safe_str(mv.iloc[i]["timestamp_utc"]),
+                                        safe_str(colv("person_name").iloc[i]),
+                                        safe_str(colv("person_email").iloc[i]),
+                                        safe_str(colv("type").iloc[i]),
+                                        safe_str(colv("crs_mrs").iloc[i]),
+                                        safe_str(colv("name").iloc[i]),
+                                        safe_str(mv.iloc[i]["product_code"]),
+                                        safe_str(colv("supplier").iloc[i]),
+                                        safe_str(colv("unit").iloc[i]),
+                                        float(mv.iloc[i]["qty_change"]),
+                                        safe_str(colv("reason").iloc[i]),
+                                        safe_str(colv("reason_other").iloc[i]),
+                                        safe_str(colv("rec_number").iloc[i]),
+                                        safe_str(colv("comments").iloc[i]),
+                                    ))
+
+                                conn.executemany(
+                                    """
+                                    INSERT INTO stock_movements (
+                                        timestamp_utc, person_name, person_email, type, crs_mrs, name,
+                                        product_code, supplier, unit, qty_change, reason, reason_other, rec_number, comments
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    rows,
+                                )
+                                conn.commit()
+                                st.success(f"Imported {len(rows)} movement rows.")
+                                st.rerun()
+
+                except Exception as e:
+                    st.error(f"Could not read file: {e}")
+
+    st.divider()
     st.subheader("Admin: Edit products")
     st.caption("This edits the master product list. Stock is always calculated from the movement log.")
 
-    # Only allow the known admin in this prototype
     is_admin = st.session_state.user_email.strip().lower() == LOGIN_USER
 
     if not is_admin:
@@ -554,7 +745,6 @@ with tab_logging:
                 if rid not in before.index:
                     continue
 
-                # Build update payload
                 conn.execute(
                     """
                     UPDATE products SET
