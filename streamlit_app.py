@@ -1,290 +1,513 @@
+import re
 from collections import defaultdict
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
-import sqlite3
 
-import streamlit as st
 import altair as alt
 import pandas as pd
+import sqlite3
+import streamlit as st
 
+st.set_page_config(page_title="Company Inventory", layout="wide")
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title="Inventory tracker",
-    page_icon=":shopping_bags:",  # This is an emoji shortcode. Could be a URL too.
-)
+# -----------------------------------------------------------------------------
+# Config
+
+DB_FILENAME = Path(__file__).parent / "inventory.db"
+
+LOGIN_USER = "lblair@mercuryrising.ie"
+LOGIN_NAME = "Lauryn Blair"
+LOGIN_PASSWORD = "whatever"  # prototype only
 
 
 # -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Helpers
 
 
-def connect_db():
-    """Connects to the sqlite database."""
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-    DB_FILENAME = Path(__file__).parent / "inventory.db"
-    db_already_exists = DB_FILENAME.exists()
 
+def safe_str(x) -> str:
+    return "" if pd.isna(x) else str(x).strip()
+
+
+def connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_FILENAME)
-    db_was_just_created = not db_already_exists
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    return conn, db_was_just_created
 
+def initialise_db(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
 
-def initialize_data(conn):
-    """Initializes the inventory table with some data."""
-    cursor = conn.cursor()
-
-    cursor.execute(
+    # Master data
+    cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS inventory (
+        CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_name TEXT,
-            price REAL,
-            units_sold INTEGER,
-            units_left INTEGER,
-            cost_price REAL,
-            reorder_point INTEGER,
-            description TEXT
+            type TEXT,
+            crs_mrs TEXT,
+            name TEXT,
+            product_code TEXT,
+            supplier TEXT,
+            unit TEXT,
+            min_stock REAL DEFAULT 0
         )
         """
     )
 
-    cursor.execute(
+    # Append-only log
+    cur.execute(
         """
-        INSERT INTO inventory
-            (item_name, price, units_sold, units_left, cost_price, reorder_point, description)
-        VALUES
-            -- Beverages
-            ('Bottled Water (500ml)', 1.50, 115, 15, 0.80, 16, 'Hydrating bottled water'),
-            ('Soda (355ml)', 2.00, 93, 8, 1.20, 10, 'Carbonated soft drink'),
-            ('Energy Drink (250ml)', 2.50, 12, 18, 1.50, 8, 'High-caffeine energy drink'),
-            ('Coffee (hot, large)', 2.75, 11, 14, 1.80, 5, 'Freshly brewed hot coffee'),
-            ('Juice (200ml)', 2.25, 11, 9, 1.30, 5, 'Fruit juice blend'),
-
-            -- Snacks
-            ('Potato Chips (small)', 2.00, 34, 16, 1.00, 10, 'Salted and crispy potato chips'),
-            ('Candy Bar', 1.50, 6, 19, 0.80, 15, 'Chocolate and candy bar'),
-            ('Granola Bar', 2.25, 3, 12, 1.30, 8, 'Healthy and nutritious granola bar'),
-            ('Cookies (pack of 6)', 2.50, 8, 8, 1.50, 5, 'Soft and chewy cookies'),
-            ('Fruit Snack Pack', 1.75, 5, 10, 1.00, 8, 'Assortment of dried fruits and nuts'),
-
-            -- Personal Care
-            ('Toothpaste', 3.50, 1, 9, 2.00, 5, 'Minty toothpaste for oral hygiene'),
-            ('Hand Sanitizer (small)', 2.00, 2, 13, 1.20, 8, 'Small sanitizer bottle for on-the-go'),
-            ('Pain Relievers (pack)', 5.00, 1, 5, 3.00, 3, 'Over-the-counter pain relief medication'),
-            ('Bandages (box)', 3.00, 0, 10, 2.00, 5, 'Box of adhesive bandages for minor cuts'),
-            ('Sunscreen (small)', 5.50, 6, 5, 3.50, 3, 'Small bottle of sunscreen for sun protection'),
-
-            -- Household
-            ('Batteries (AA, pack of 4)', 4.00, 1, 5, 2.50, 3, 'Pack of 4 AA batteries'),
-            ('Light Bulbs (LED, 2-pack)', 6.00, 3, 3, 4.00, 2, 'Energy-efficient LED light bulbs'),
-            ('Trash Bags (small, 10-pack)', 3.00, 5, 10, 2.00, 5, 'Small trash bags for everyday use'),
-            ('Paper Towels (single roll)', 2.50, 3, 8, 1.50, 5, 'Single roll of paper towels'),
-            ('Multi-Surface Cleaner', 4.50, 2, 5, 3.00, 3, 'All-purpose cleaning spray'),
-
-            -- Others
-            ('Lottery Tickets', 2.00, 17, 20, 1.50, 10, 'Assorted lottery tickets'),
-            ('Newspaper', 1.50, 22, 20, 1.00, 5, 'Daily newspaper')
+        CREATE TABLE IF NOT EXISTS stock_movements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp_utc TEXT,
+            person_name TEXT,
+            person_email TEXT,
+            type TEXT,
+            crs_mrs TEXT,
+            name TEXT,
+            product_code TEXT,
+            supplier TEXT,
+            unit TEXT,
+            qty_change REAL,
+            reason TEXT,
+            reason_other TEXT,
+            rec_number TEXT,
+            comments TEXT
+        )
         """
     )
+
+    # Optional: choices (keeps dropdown lists tidy)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lookups (
+            key TEXT,
+            value TEXT
+        )
+        """
+    )
+
     conn.commit()
 
 
-def load_data(conn):
-    """Loads the inventory data from the database."""
-    cursor = conn.cursor()
+def seed_if_empty(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS n FROM products")
+    n = int(cur.fetchone()[0])
+    if n > 0:
+        return
 
-    try:
-        cursor.execute("SELECT * FROM inventory")
-        data = cursor.fetchall()
-    except:
-        return None
+    # Very small seed so the app runs immediately.
+    cur.execute(
+        """
+        INSERT INTO products (type, crs_mrs, name, product_code, supplier, unit, min_stock)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("Manufacturing", "CRS-0001", "Example Item", "EX-0001", "Example Supplier", "piece", 5),
+    )
 
-    df = pd.DataFrame(
-        data,
-        columns=[
-            "id",
-            "item_name",
-            "price",
-            "units_sold",
-            "units_left",
-            "cost_price",
-            "reorder_point",
-            "description",
+    # Seed lookup values
+    lookup_seed = [
+        ("supplier", "Example Supplier"),
+        ("reason", "Receipt"),
+        ("reason", "Issued to Production"),
+        ("reason", "QC testing"),
+        ("reason", "Write-off"),
+        ("reason", "Other"),
+    ]
+    cur.executemany("INSERT INTO lookups (key, value) VALUES (?, ?)", lookup_seed)
+
+    conn.commit()
+
+
+def df_from_query(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> pd.DataFrame:
+    return pd.read_sql_query(sql, conn, params=params)
+
+
+def get_lookup_values(conn: sqlite3.Connection, key: str) -> list[str]:
+    df = df_from_query(conn, "SELECT value FROM lookups WHERE key = ? ORDER BY value", (key,))
+    values = [safe_str(v) for v in df["value"].tolist() if safe_str(v)]
+    return values
+
+
+def compute_current_stock(conn: sqlite3.Connection) -> pd.Series:
+    df = df_from_query(
+        conn,
+        """
+        SELECT product_code, COALESCE(SUM(qty_change), 0) AS current_stock
+        FROM stock_movements
+        GROUP BY product_code
+        """,
+    )
+    if df.empty:
+        return pd.Series(dtype=float)
+    return pd.Series(df.current_stock.values, index=df.product_code.astype(str))
+
+
+def export_excel(products: pd.DataFrame, movements: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        products.to_excel(writer, sheet_name="Products", index=False)
+        movements.to_excel(writer, sheet_name="StockMovements", index=False)
+    return output.getvalue()
+
+
+def require_login() -> None:
+    if "authed" not in st.session_state:
+        st.session_state.authed = False
+    if "user_email" not in st.session_state:
+        st.session_state.user_email = ""
+    if "user_name" not in st.session_state:
+        st.session_state.user_name = ""
+
+    if st.session_state.authed:
+        return
+
+    st.title("Inventory")
+    st.subheader("Sign in (prototype)")
+    with st.form("login"):
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in")
+
+    if submitted:
+        if email.strip().lower() == LOGIN_USER and password == LOGIN_PASSWORD:
+            st.session_state.authed = True
+            st.session_state.user_email = LOGIN_USER
+            st.session_state.user_name = LOGIN_NAME
+            st.rerun()
+        else:
+            st.error("Invalid credentials")
+
+    st.stop()
+
+
+# -----------------------------------------------------------------------------
+# App start
+
+require_login()
+
+conn = connect_db()
+initialise_db(conn)
+seed_if_empty(conn)
+
+# Load data
+products = df_from_query(
+    conn,
+    """
+    SELECT id, type, crs_mrs, name, product_code, supplier, unit, min_stock
+    FROM products
+    """,
+)
+
+movements = df_from_query(
+    conn,
+    """
+    SELECT id, timestamp_utc, person_name, person_email, type, crs_mrs, name, product_code, supplier,
+           unit, qty_change, reason, reason_other, rec_number, comments
+    FROM stock_movements
+    ORDER BY timestamp_utc DESC
+    """,
+)
+
+current_stock = compute_current_stock(conn)
+products = products.copy()
+products["current_stock"] = products["product_code"].astype(str).map(current_stock).fillna(0.0)
+products["low_stock"] = products["current_stock"] < products["min_stock"].fillna(0.0)
+
+st.title("Inventory")
+
+# Tabs: 3 only
+tab_dashboard, tab_visuals, tab_logging = st.tabs(["Dashboard", "Visuals", "Logging"])
+
+
+# -----------------------------------------------------------------------------
+# Dashboard
+
+with tab_dashboard:
+    st.subheader("Overview")
+
+    # Page-specific filters ONLY
+    f1, f2, f3 = st.columns([1.1, 2.2, 1.2])
+    with f1:
+        types = ["All"] + sorted([t for t in products["type"].dropna().astype(str).unique().tolist() if t])
+        type_sel = st.selectbox("Type", options=types, key="dash_type")
+    with f2:
+        search = st.text_input("MRS/CRS & Name", value="", key="dash_search").strip().lower()
+    with f3:
+        suppliers = ["All"] + sorted([s for s in products["supplier"].dropna().astype(str).unique().tolist() if s])
+        supplier_sel = st.selectbox("Supplier", options=suppliers, key="dash_supplier")
+
+    view = products.copy()
+    if type_sel != "All":
+        view = view[view["type"].astype(str) == str(type_sel)]
+    if supplier_sel != "All":
+        view = view[view["supplier"].astype(str) == str(supplier_sel)]
+    if search:
+        view = view[
+            view["name"].astype(str).str.lower().str.contains(search)
+            | view["crs_mrs"].astype(str).str.lower().str.contains(search)
+            | view["product_code"].astype(str).str.lower().str.contains(search)
+        ]
+
+    m1, m2 = st.columns(2)
+    m1.metric("Products (filtered)", int(view.shape[0]))
+    m2.metric("Low stock (filtered)", int(view["low_stock"].sum()))
+
+    st.dataframe(
+        view.sort_values(["low_stock", "name"], ascending=[False, True])[[
+            "type", "crs_mrs", "name", "product_code", "supplier", "unit", "current_stock", "min_stock", "low_stock"
+        ]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Visuals (kept basic for now)
+
+with tab_visuals:
+    st.subheader("Visuals")
+
+    f1, f2, f3 = st.columns([1.1, 2.2, 1.2])
+    with f1:
+        types = ["All"] + sorted([t for t in products["type"].dropna().astype(str).unique().tolist() if t])
+        type_sel = st.selectbox("Type", options=types, key="viz_type")
+    with f2:
+        search = st.text_input("MRS/CRS & Name", value="", key="viz_search").strip().lower()
+    with f3:
+        suppliers = ["All"] + sorted([s for s in products["supplier"].dropna().astype(str).unique().tolist() if s])
+        supplier_sel = st.selectbox("Supplier", options=suppliers, key="viz_supplier")
+
+    view = products.copy()
+    if type_sel != "All":
+        view = view[view["type"].astype(str) == str(type_sel)]
+    if supplier_sel != "All":
+        view = view[view["supplier"].astype(str) == str(supplier_sel)]
+    if search:
+        view = view[
+            view["name"].astype(str).str.lower().str.contains(search)
+            | view["crs_mrs"].astype(str).str.lower().str.contains(search)
+            | view["product_code"].astype(str).str.lower().str.contains(search)
+        ]
+
+    if view.empty:
+        st.info("No products match your filters.")
+    else:
+        # Prettier selector label
+        view = view.copy()
+        view["label"] = view.apply(lambda r: f"{safe_str(r['crs_mrs'])} | {safe_str(r['product_code'])} — {safe_str(r['name'])}", axis=1)
+        label_to_code = dict(zip(view["label"], view["product_code"].astype(str)))
+
+        selected = st.selectbox("Select product", options=["(Select a product)"] + sorted(view["label"].tolist()))
+
+        if selected == "(Select a product)":
+            st.info("Select a product to see usage over time.")
+        else:
+            code = label_to_code[selected]
+            prod_row = products.loc[products["product_code"].astype(str) == str(code)].iloc[0].to_dict()
+
+            # Stock over time from movements
+            mv = movements[movements["product_code"].astype(str) == str(code)].copy()
+            if mv.empty:
+                st.warning("No movements recorded for this product yet.")
+            else:
+                mv["timestamp_utc"] = pd.to_datetime(mv["timestamp_utc"], errors="coerce", utc=True)
+                mv = mv.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc")
+
+                ts = mv[["timestamp_utc", "qty_change"]].rename(columns={"timestamp_utc": "TimestampUTC"}).copy()
+                ts["stock_level"] = ts["qty_change"].cumsum()
+
+                min_stock = float(prod_row.get("min_stock", 0.0) or 0.0)
+
+                chart_df = ts.set_index("TimestampUTC")
+                chart_df["min_stock"] = min_stock
+
+                st.line_chart(chart_df[["stock_level", "min_stock"]])
+
+
+# -----------------------------------------------------------------------------
+# Logging (movement entry + basic admin editing in separate section)
+
+with tab_logging:
+    st.subheader("Logging")
+    st.caption(f"Signed in as {st.session_state.user_name} ({st.session_state.user_email})")
+
+    mode = st.radio(
+        "Action",
+        options=[
+            "1. Change stock of item currently in system",
+            "2. Add new item to system (from PO)",
+            "3. Add new item to system (not from PO, R&D ONLY)",
         ],
+        index=0,
     )
 
-    return df
+    # Shared filters on this tab
+    f1, f2, f3 = st.columns([1.1, 2.2, 1.2])
+    with f1:
+        types = ["All"] + sorted([t for t in products["type"].dropna().astype(str).unique().tolist() if t])
+        type_sel = st.selectbox("Type", options=types, key="log_type")
+    with f2:
+        search = st.text_input("MRS/CRS & Name", value="", key="log_search").strip().lower()
+    with f3:
+        suppliers = ["All"] + sorted([s for s in products["supplier"].dropna().astype(str).unique().tolist() if s])
+        supplier_sel = st.selectbox("Supplier", options=suppliers, key="log_supplier")
 
+    view = products.copy()
+    if type_sel != "All":
+        view = view[view["type"].astype(str) == str(type_sel)]
+    if supplier_sel != "All":
+        view = view[view["supplier"].astype(str) == str(supplier_sel)]
+    if search:
+        view = view[
+            view["name"].astype(str).str.lower().str.contains(search)
+            | view["crs_mrs"].astype(str).str.lower().str.contains(search)
+            | view["product_code"].astype(str).str.lower().str.contains(search)
+        ]
 
-def update_data(conn, df, changes):
-    """Updates the inventory data in the database."""
-    cursor = conn.cursor()
+    if mode.startswith("1"):
+        st.markdown("### Change stock")
 
-    if changes["edited_rows"]:
-        deltas = st.session_state.inventory_table["edited_rows"]
-        rows = []
+        if view.empty:
+            st.info("No products match your filters.")
+        else:
+            view = view.copy()
+            view["label"] = view.apply(lambda r: f"{safe_str(r['crs_mrs'])} | {safe_str(r['product_code'])} — {safe_str(r['name'])}", axis=1)
+            label_to_code = dict(zip(view["label"], view["product_code"].astype(str)))
 
-        for i, delta in deltas.items():
-            row_dict = df.iloc[i].to_dict()
-            row_dict.update(delta)
-            rows.append(row_dict)
+            selected = st.selectbox("Select item", options=["(Select an item)"] + sorted(view["label"].tolist()))
 
-        cursor.executemany(
-            """
-            UPDATE inventory
-            SET
-                item_name = :item_name,
-                price = :price,
-                units_sold = :units_sold,
-                units_left = :units_left,
-                cost_price = :cost_price,
-                reorder_point = :reorder_point,
-                description = :description
-            WHERE id = :id
-            """,
-            rows,
+            if selected == "(Select an item)":
+                st.info("Select an item to log a movement.")
+            else:
+                code = label_to_code[selected]
+                prod_row = products.loc[products["product_code"].astype(str) == str(code)].iloc[0].to_dict()
+
+                # Non-editable fields
+                unit = safe_str(prod_row.get("unit", ""))
+                name = safe_str(prod_row.get("name", ""))
+                crs_mrs = safe_str(prod_row.get("crs_mrs", ""))
+                ptype = safe_str(prod_row.get("type", ""))
+
+                st.write({
+                    "Type": ptype,
+                    "CRS/MRS": crs_mrs,
+                    "Name": name,
+                    "Product code": code,
+                    "Unit": unit,
+                    "Current stock": float(prod_row.get("current_stock", 0.0) or 0.0),
+                    "Min stock": float(prod_row.get("min_stock", 0.0) or 0.0),
+                })
+
+                supplier_options = get_lookup_values(conn, "supplier")
+                if not supplier_options:
+                    supplier_options = sorted([s for s in products["supplier"].dropna().astype(str).unique().tolist() if s])
+
+                reason_options = get_lookup_values(conn, "reason")
+                if not reason_options:
+                    reason_options = ["Receipt", "Issued to Production", "QC testing", "Write-off", "Other"]
+
+                # Existing rec numbers for OUT dropdown
+                recs_df = df_from_query(conn, "SELECT DISTINCT rec_number FROM stock_movements WHERE product_code = ? AND rec_number IS NOT NULL AND rec_number <> '' ORDER BY rec_number", (code,))
+                rec_numbers = [safe_str(x) for x in recs_df["rec_number"].tolist() if safe_str(x)]
+
+                with st.form("movement_form"):
+                    c1, c2, c3 = st.columns([1.0, 1.0, 1.2])
+                    with c1:
+                        direction = st.selectbox("Direction", options=["OUT", "IN"], index=0)
+                    with c2:
+                        qty = st.number_input("Quantity", min_value=0.0, value=1.0, step=1.0)
+                    with c3:
+                        supplier = st.selectbox("Supplier", options=supplier_options, index=0)
+
+                    st.text_input("Unit (fixed)", value=unit, disabled=True)
+
+                    r1, r2 = st.columns([1.0, 2.0])
+                    with r1:
+                        reason = st.selectbox("Reason", options=reason_options)
+                    with r2:
+                        reason_other = st.text_input("Other reason (required if Reason = Other)")
+
+                    if direction == "OUT":
+                        rec_number = st.selectbox("Rec number (OUT)", options=(rec_numbers if rec_numbers else [""]))
+                    else:
+                        rec_number = st.text_input("Rec number (IN)")
+
+                    comments = st.text_area("Comments", value="")
+                    submitted = st.form_submit_button("Submit")
+
+                if submitted:
+                    if qty <= 0:
+                        st.error("Quantity must be greater than 0")
+                        st.stop()
+
+                    if reason == "Other" and not safe_str(reason_other):
+                        st.error("Other reason is required when Reason is Other")
+                        st.stop()
+
+                    qty_change = float(qty) if direction == "IN" else -float(qty)
+
+                    # Insert movement row
+                    conn.execute(
+                        """
+                        INSERT INTO stock_movements (
+                            timestamp_utc, person_name, person_email,
+                            type, crs_mrs, name, product_code, supplier, unit,
+                            qty_change, reason, reason_other, rec_number, comments
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            now_utc_iso(),
+                            st.session_state.user_name,
+                            st.session_state.user_email,
+                            ptype,
+                            crs_mrs,
+                            name,
+                            code,
+                            supplier,
+                            unit,
+                            qty_change,
+                            reason,
+                            safe_str(reason_other) if reason == "Other" else "",
+                            safe_str(rec_number),
+                            safe_str(comments),
+                        ),
+                    )
+                    conn.commit()
+
+                    st.success("Movement logged.")
+                    st.rerun()
+
+    else:
+        st.info("We will implement Add-from-PO and R&D-only add flows next.")
+
+    st.divider()
+    st.subheader("Exports")
+    if st.button("Download inventory + movement log (Excel)"):
+        # Refresh data for export
+        products2 = df_from_query(conn, "SELECT id, type, crs_mrs, name, product_code, supplier, unit, min_stock FROM products")
+        movements2 = df_from_query(conn, "SELECT * FROM stock_movements ORDER BY timestamp_utc DESC")
+        # add computed current_stock
+        current2 = compute_current_stock(conn)
+        products2 = products2.copy()
+        products2["current_stock"] = products2["product_code"].astype(str).map(current2).fillna(0.0)
+
+        payload = export_excel(products2, movements2)
+        st.download_button(
+            "Download Excel",
+            data=payload,
+            file_name="inventory_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    if changes["added_rows"]:
-        cursor.executemany(
-            """
-            INSERT INTO inventory
-                (id, item_name, price, units_sold, units_left, cost_price, reorder_point, description)
-            VALUES
-                (:id, :item_name, :price, :units_sold, :units_left, :cost_price, :reorder_point, :description)
-            """,
-            (defaultdict(lambda: None, row) for row in changes["added_rows"]),
-        )
-
-    if changes["deleted_rows"]:
-        cursor.executemany(
-            "DELETE FROM inventory WHERE id = :id",
-            ({"id": int(df.loc[i, "id"])} for i in changes["deleted_rows"]),
-        )
-
-    conn.commit()
-
-
-# -----------------------------------------------------------------------------
-# Draw the actual page, starting with the inventory table.
-
-# Set the title that appears at the top of the page.
-"""
-# :shopping_bags: Inventory tracker
-
-**Welcome to Alice's Corner Store's intentory tracker!**
-This page reads and writes directly from/to our inventory database.
-"""
-
-st.info(
-    """
-    Use the table below to add, remove, and edit items.
-    And don't forget to commit your changes when you're done.
-    """
+st.caption(
+    "Note: This prototype writes to a local sqlite file (inventory.db) for simplicity. "
+    "If you deploy to a shared server, everyone will see the same live data."
 )
 
-# Connect to database and create table if needed
-conn, db_was_just_created = connect_db()
-
-# Initialize data.
-if db_was_just_created:
-    initialize_data(conn)
-    st.toast("Database initialized with some sample data.")
-
-# Load data from database
-df = load_data(conn)
-
-# Display data with editable table
-edited_df = st.data_editor(
-    df,
-    disabled=["id"],  # Don't allow editing the 'id' column.
-    num_rows="dynamic",  # Allow appending/deleting rows.
-    column_config={
-        # Show dollar sign before price columns.
-        "price": st.column_config.NumberColumn(format="$%.2f"),
-        "cost_price": st.column_config.NumberColumn(format="$%.2f"),
-    },
-    key="inventory_table",
-)
-
-has_uncommitted_changes = any(len(v) for v in st.session_state.inventory_table.values())
-
-st.button(
-    "Commit changes",
-    type="primary",
-    disabled=not has_uncommitted_changes,
-    # Update data in database
-    on_click=update_data,
-    args=(conn, df, st.session_state.inventory_table),
-)
-
-
-# -----------------------------------------------------------------------------
-# Now some cool charts
-
-# Add some space
-""
-""
-""
-
-st.subheader("Units left", divider="red")
-
-need_to_reorder = df[df["units_left"] < df["reorder_point"]].loc[:, "item_name"]
-
-if len(need_to_reorder) > 0:
-    items = "\n".join(f"* {name}" for name in need_to_reorder)
-
-    st.error(f"We're running dangerously low on the items below:\n {items}")
-
-""
-""
-
-st.altair_chart(
-    # Layer 1: Bar chart.
-    alt.Chart(df)
-    .mark_bar(
-        orient="horizontal",
-    )
-    .encode(
-        x="units_left",
-        y="item_name",
-    )
-    # Layer 2: Chart showing the reorder point.
-    + alt.Chart(df)
-    .mark_point(
-        shape="diamond",
-        filled=True,
-        size=50,
-        color="salmon",
-        opacity=1,
-    )
-    .encode(
-        x="reorder_point",
-        y="item_name",
-    ),
-    use_container_width=True,
-)
-
-st.caption("NOTE: The :diamonds: location shows the reorder point.")
-
-""
-""
-""
-
-# -----------------------------------------------------------------------------
-
-st.subheader("Best sellers", divider="orange")
-
-""
-""
-
-st.altair_chart(
-    alt.Chart(df)
-    .mark_bar(orient="horizontal")
-    .encode(
-        x="units_sold",
-        y=alt.Y("item_name").sort("-x"),
-    ),
-    use_container_width=True,
-)
+#To run app: streamlit run "C:\Users\LaurynBlair\OneDrive - Mercury Rising Ltd\Projects\Production Scheduler\App.py"
